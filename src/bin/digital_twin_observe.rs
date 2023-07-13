@@ -23,13 +23,13 @@ struct Led {
 
 // Embassy main, where tasks can be spawned
 #[embassy_executor::main]
-async fn main(_spawner: Spawner) {
+async fn main(spawner: Spawner) {
     // Initialize heap data for allocation
     info!("Initialize heap");
     heap::init();
 
     // Run the sample program, will not return unless an error occurs
-    match run().await {
+    match run(spawner: Spawner).await {
         Ok(()) => info!("Program complete!"),
         Err(e) => {
             // If we get here, we have problems
@@ -40,7 +40,7 @@ async fn main(_spawner: Spawner) {
     utils::exit();
 }
 
-async fn run() -> Result<(), Error> {
+async fn run(spawner: Spawner) -> Result<(), Error> {
     info!("starting application");
     // Handle for device peripherals
     let p = embassy_nrf::init(Default::default());

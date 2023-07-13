@@ -14,10 +14,8 @@ pub mod utils;
 
 use crate::config::{GOLIOTH_SERVER_PORT, GOLIOTH_SERVER_URL, SECURITY_TAG};
 use crate::errors::Error;
-use alloc::format;
-use alloc::string::String;
+use crate::utils::{create_token, get_formatted_path};
 use alloc::vec::Vec;
-use at_commands::parser::CommandParser;
 use coap_lite::MessageType::NonConfirmable;
 use coap_lite::{CoapRequest, ContentFormat, ObserveOption, Packet, RequestType};
 use core::cell::RefCell;
@@ -25,15 +23,14 @@ use core::option::Option;
 use core::str;
 use core::sync::atomic::{AtomicU16, Ordering};
 use core::task::Poll;
-use defmt::{debug, unwrap, Debug2Format};
+use defmt::{unwrap, info, trace};
 use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::waitqueue::WakerRegistration;
-use embassy_time::{with_timeout, Duration};
-use futures::future::poll_fn;
-use nanorand::{Rng, WyRand};
+// use embassy_time::{with_timeout, Duration};
+use core::future::poll_fn;
 use nrf_modem::{DtlsSocket, OwnedDtlsReceiveSocket, OwnedDtlsSendSocket, PeerVerification};
 use panic_probe as _;
 use serde::de::DeserializeOwned;
@@ -53,6 +50,43 @@ static MESSAGE_ID_COUNTER: AtomicU16 = AtomicU16::new(0);
 // Use ThreadModeRawMutex when data is shared between tasks running on the same executor but you want a singleton.
 static REQUESTS: Mutex<ThreadModeRawMutex, RefCell<Vec<PendingRequest>>> =
     Mutex::new(RefCell::new(Vec::new()));
+
+// if at some point, more than one socket is allowed then set
+// pool_size = nrfxlib_sys::NRF_MODEM_MAX_SOCKET_COUNT)
+#[embassy_executor::task(pool_size = 1)]
+async fn socket_rx_task(rx: OwnedDtlsReceiveSocket) -> ! {
+    info!("RX Task: spawned");
+    // buffer for holding response bytes
+    let mut buf = [0; 1024];
+    loop {
+        // wait for rsponses
+        trace!("RX Task: waiting for a response");
+        let (response, _src_addr) = unwrap!(rx.receive_from(&mut buf[..]).await);
+        // parse response bytes into CoAP packets and get the token
+        trace!("RX Task: {} Bytes received", response.len());
+        if response.len() > 0 {
+            let packet = Packet::from_bytes(&response).unwrap();
+            let response_token = packet.get_token();
+
+            trace!("RX Task: response bytes {:X}", &response);
+            trace!("RX Task: response token {}", &response_token);
+
+            REQUESTS.lock(|this| {
+                for request in this.borrow_mut().iter_mut() {
+                    if let RequestState::Pending() = request.state {
+                        if request.token == response_token {
+                            trace!("RX Task: marking pending request as `Done`");
+                            request.state = RequestState::Done {
+                                packet: packet.clone(),
+                            }
+                        }
+                    }
+                    request.waker.wake();
+                }
+            });
+        };
+    };
+}
 
 /// Enum for light_db write types
 #[derive(Debug)]
@@ -88,10 +122,55 @@ impl PendingRequest {
     }
 }
 
+/// register a PendingRequest in our Mutex so it can be used to match with in the rx task
+pub fn register_request(token: [u8; 8], is_observer: bool) {
+    info!("registering request for response matching");
+
+    let new_request = PendingRequest::new(token, is_observer);
+    REQUESTS.lock(|this| {
+        this.borrow_mut().push(new_request);
+    });
+}
+
+
+pub async fn request_wait_complete(token: [u8; 8]) -> Packet {
+    poll_fn(|cx| {
+        let mut remove_ndx: Option<usize> = None;
+        let mut result = Poll::Pending;
+
+        REQUESTS.lock(|this| {
+            for (i, shared) in this.borrow_mut().iter_mut().enumerate() {
+                if shared.token == token {
+                    if let RequestState::Done { packet } = &shared.state {
+                        trace!("Request response received");
+                        result = Poll::Ready(packet.clone());
+                        if shared.is_observer {
+                            shared.state = RequestState::Pending();
+                        } else {
+                            remove_ndx = Some(i);
+                        };
+                        break;
+                    }
+                }
+                trace!("Registering waker");
+                shared.waker.register(cx.waker());
+            }
+            // Remove finished requests if they are not observers
+            if let Some(i) = remove_ndx {
+                trace!("removing REQUESTS at index: {}", &i);
+                this.borrow_mut().remove(i);
+            };
+            // Return received packet
+            result
+        })
+    })
+        .await
+}
+
 /// Struct to hold our DTLS Socket to Golioth, should live the length of the program
 pub struct Golioth {
     tx: OwnedDtlsSendSocket,
-    // requests: SharedRequests,
+    // requests: SharedRequests, // In case we want to handle multiple sockets
 }
 
 impl Golioth {
@@ -104,12 +183,9 @@ impl Golioth {
         )
             .await?;
 
-        // // Split the socket so the responses can run in their own task
-        // let static_socket= Box::new(socket);
-        // let leaked_socket = Box::leak(static_socket);
-        // let (rx,tx) = leaked_socket.split();
+        // Split the socket so the responses can run in their own task
         let (rx, tx) = socket.split_owned().await?;
-        debug!("DTLS Socket created");
+        info!("DTLS Socket created");
 
         // create a SharedRequests instance for sharing requests between rx and main (tx) tasks
         // let requests = SharedRequests::new();
@@ -140,13 +216,14 @@ impl Golioth {
 
         request.message.set_token(token.to_vec());
 
-        debug!("set lighdb write path: {}", &formatted_path.as_str());
+        trace!("set lighdb write path: {}", &formatted_path.as_str());
         // register a new request
         register_request(token.clone(), false);
 
-        debug!("sending read bytes");
+        info!("sending read bytes");
         self.tx.send(&request.message.to_bytes()?).await?;
         let response = request_wait_complete(token).await;
+
         // let response = with_timeout(
         //     Duration::from_secs(15),
         //     request_wait_complete(token)
@@ -180,8 +257,8 @@ impl Golioth {
             .set_content_format(ContentFormat::ApplicationJSON);
         request.message.payload = serde_json::to_vec(&v)?;
 
-        debug!("set lighdb write path: {}", &formatted_path.as_str());
-        debug!("sending write bytes");
+        trace!("set lighdb write path: {}", &formatted_path.as_str());
+        info!("sending write bytes");
         self.tx.send(&request.message.to_bytes()?).await?;
 
         Ok(())
@@ -196,7 +273,7 @@ impl Golioth {
         let mut request: CoapRequest<OwnedDtlsSendSocket> = CoapRequest::new();
         let token = create_token();
         let formatted_path = get_formatted_path(LightDBType::State, path);
-        debug!(
+        trace!(
             "set lighdb path for observing: {}",
             &formatted_path.as_str()
         );
@@ -214,130 +291,5 @@ impl Golioth {
 
         Ok(request)
     }
-
-    // pub async fn deregister_observer{};
 }
 
-#[inline]
-fn get_formatted_path(db_type: LightDBType, path: &str) -> String {
-    match db_type {
-        LightDBType::State => {
-            format!(".d/{}", path)
-        }
-        LightDBType::Stream => {
-            format!(".s/{}", path)
-        }
-    }
-}
-
-/// The nRF9160 does not have a RNG peripheral.  To bypass using the Cryptocell C-lib
-/// we can just use the current uptime ticks u64 value as a way to create a unique "enough"
-/// token as to not be easily spoofed.
-fn create_token() -> [u8; 8] {
-    let seed = embassy_time::Instant::now().as_ticks();
-    let mut rng = WyRand::new_seed(seed);
-    let token: [u8; 8] = rng.generate::<u64>().to_ne_bytes();
-
-    debug!("WyRand Request Token: {}", Debug2Format(&token));
-    token
-}
-
-/// register a PendingRequest in our Mutex so it can be used to match with in the rx task
-pub fn register_request(token: [u8; 8], is_observer: bool) {
-    debug!("registering request for response matching");
-
-    let new_request = PendingRequest::new(token, is_observer);
-    REQUESTS.lock(|this| {
-        this.borrow_mut().push(new_request);
-    });
-}
-
-pub async fn request_wait_complete(token: [u8; 8]) -> Packet {
-    poll_fn(|cx| {
-        let mut remove_ndx: Option<usize> = None;
-        let mut result = Poll::Pending;
-
-        REQUESTS.lock(|this| {
-            for (i, shared) in this.borrow_mut().iter_mut().enumerate() {
-                if shared.token == token {
-                    if let RequestState::Done { packet } = &shared.state {
-                        result = Poll::Ready(packet.clone());
-                        if shared.is_observer {
-                            shared.state = RequestState::Pending();
-                        } else {
-                            remove_ndx = Some(i);
-                        };
-                        break;
-                    }
-                }
-                shared.waker.register(cx.waker());
-            }
-            // Remove finished requests if they are not observers
-            if let Some(i) = remove_ndx {
-                this.borrow_mut().remove(i);
-            };
-            debug!("wait_complete result: {}", Debug2Format(&result));
-            // Return received packet
-            result
-        })
-    })
-        .await
-}
-
-/// Get the current signal strength from the modem using AT+CESQ
-pub async fn get_signal_strength() -> Result<i32, Error> {
-    let command = nrf_modem::send_at::<32>("AT+CESQ").await?;
-
-    let (_, _, _, _, _, mut signal) = CommandParser::parse(command.as_bytes())
-        .expect_identifier(b"+CESQ:")
-        .expect_int_parameter()
-        .expect_int_parameter()
-        .expect_int_parameter()
-        .expect_int_parameter()
-        .expect_int_parameter()
-        .expect_int_parameter()
-        .expect_identifier(b"\r\n")
-        .finish()
-        .unwrap();
-    if signal != 255 {
-        signal += -140;
-    }
-    Ok(signal)
-}
-
-// if at some point, more than one socket is allowed then set
-// pool_size = nrfxlib_sys::NRF_MODEM_MAX_SOCKET_COUNT)
-#[embassy_executor::task(pool_size = 1)]
-async fn socket_rx_task(rx: OwnedDtlsReceiveSocket) -> ! {
-    debug!("RX Task: spawned");
-    // buffer for holding response bytes
-    let mut buf = [0; 1024];
-    loop {
-        // wait for rsponses
-        debug!("RX Task: waiting for a response");
-        let (response, _src_addr) = unwrap!(rx.receive_from(&mut buf[..]).await);
-        // parse response bytes into CoAP packets and get the token
-        debug!("RX Task: {} Bytes received", response.len());
-        if response.len() > 0 {
-            let packet = Packet::from_bytes(&response).unwrap();
-            let response_token = packet.get_token();
-
-            debug!("RX Task: response bytes {:X}", &response);
-            debug!("RX Task: response token {}", &response_token);
-
-            REQUESTS.lock(|this| {
-                for request in this.borrow_mut().iter_mut() {
-                    if let RequestState::Pending() = request.state {
-                        if request.token == response_token {
-                            debug!("RX Task: marking pending request as `Done`");
-                            request.state = RequestState::Done {
-                                packet: packet.clone(),
-                            }
-                        }
-                    }
-                    request.waker.wake();
-                }
-            });
-        };
-    };
-}

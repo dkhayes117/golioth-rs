@@ -3,7 +3,7 @@
 #![feature(type_alias_impl_trait)]
 
 use cortex_m::peripheral::NVIC;
-use defmt::{error, info, unwrap, Format};
+use defmt::{error, info, unwrap, Format, debug};
 use embassy_executor::Spawner;
 use embassy_nrf::{interrupt, pac};
 use embassy_time::{Duration, Timer};
@@ -103,6 +103,7 @@ async fn run(spawner: Spawner) -> Result<(), Error> {
 #[interrupt]
 #[allow(non_snake_case)]
 fn EGU1() {
+    debug!("EGU1 fired");
     nrf_modem::application_irq_handler();
     cortex_m::asm::sev();
 }
@@ -111,6 +112,7 @@ fn EGU1() {
 #[interrupt]
 #[allow(non_snake_case)]
 fn IPC() {
+    debug!("IPC fired");
     nrf_modem::ipc_irq_handler();
     cortex_m::asm::sev();
 }
